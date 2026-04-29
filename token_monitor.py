@@ -50,12 +50,14 @@ def save_cache(cache: dict) -> None:
 
 # ── JSONL parsing ─────────────────────────────────
 def parse_jsonl(path: str, start_line: int, seen_ids: set) -> tuple:
-    """Parse JSONL from start_line (1-based) to end. Returns (totals_dict, seen_ids, line_count)."""
+    """Parse JSONL from start_line (1-based) to end.
+    Returns (totals_dict, seen_ids, line_count, last_ctx_used)."""
     totals = {"input": 0, "output": 0, "cache_create": 0, "cache_read": 0}
+    last_ctx_used = None
     if not os.path.isfile(path):
-        return totals, seen_ids, 0
+        return totals, seen_ids, 0, last_ctx_used
 
-    lc = start_line - 1  # will be 0 for fresh parse
+    lc = start_line - 1
     try:
         with open(path, "r", encoding="utf-8") as f:
             for i, line in enumerate(f, 1):
@@ -73,7 +75,7 @@ def parse_jsonl(path: str, start_line: int, seen_ids: set) -> tuple:
                     continue
                 mid = msg.get("id")
                 if mid and mid in seen_ids:
-                    continue  # deduplicate (thinking/text/tool_use share same usage)
+                    continue
 
                 usage = msg["usage"]
                 totals["input"] += usage.get("input_tokens", 0)
@@ -82,32 +84,38 @@ def parse_jsonl(path: str, start_line: int, seen_ids: set) -> tuple:
                 totals["cache_read"] += usage.get("cache_read_input_tokens", 0)
                 if mid:
                     seen_ids.add(mid)
+                # Track last call's context usage (what was actually sent to model)
+                last_ctx_used = (
+                    usage.get("input_tokens", 0)
+                    + usage.get("cache_read_input_tokens", 0)
+                    + usage.get("cache_creation_input_tokens", 0)
+                )
     except Exception:
         pass
-    return totals, seen_ids, lc
+    return totals, seen_ids, lc, last_ctx_used
 
 
 # ── Session totals (with caching) ─────────────────
-def get_session_totals(transcript_path: str, cache: dict) -> dict:
+def get_session_totals(transcript_path: str, cache: dict) -> tuple:
+    """Returns (totals_dict, last_ctx_used)."""
     entry = cache.get(transcript_path, {})
     cached_totals = entry.get("totals", {})
     seen_ids = set(entry.get("seen_message_ids", []))
     prev_line_count = entry.get("line_count", 0)
+    last_ctx_used = entry.get("last_ctx_used")
 
     try:
         file_size = os.path.getsize(transcript_path)
     except OSError:
         file_size = 0
 
-    # Cache hit: file size unchanged
+    # Cache hit
     if entry and entry.get("file_size") == file_size and cached_totals:
-        return cached_totals
+        return cached_totals, last_ctx_used
 
-    # Incremental parse
     start_line = prev_line_count + 1 if prev_line_count > 0 else 1
-    new_totals, seen_ids, line_count = parse_jsonl(transcript_path, start_line, seen_ids)
+    new_totals, seen_ids, line_count, new_ctx = parse_jsonl(transcript_path, start_line, seen_ids)
 
-    # Merge
     totals = {
         "input": cached_totals.get("input", 0) + new_totals["input"],
         "output": cached_totals.get("output", 0) + new_totals["output"],
@@ -115,15 +123,18 @@ def get_session_totals(transcript_path: str, cache: dict) -> dict:
         "cache_read": cached_totals.get("cache_read", 0) + new_totals["cache_read"],
     }
 
-    # Update cache
+    if new_ctx is not None:
+        last_ctx_used = new_ctx
+
     cache[transcript_path] = {
         "line_count": line_count,
         "file_size": file_size,
         "seen_message_ids": list(seen_ids),
         "totals": totals,
+        "last_ctx_used": last_ctx_used,
     }
     save_cache(cache)
-    return totals
+    return totals, last_ctx_used
 
 
 # ── Output formatting ─────────────────────────────
@@ -168,21 +179,27 @@ def main():
 
     model = (data.get("model") or {}).get("display_name", data.get("model", {}).get("id", "?"))
     ctx = data.get("context_window") or {}
-    ctx_used = ctx.get("total_input_tokens")
     ctx_size = ctx.get("context_window_size")
-    # Compute percentage ourselves — Claude Code's used_percentage may be
-    # inaccurate for non-Anthropic models (e.g. MiniMax via custom endpoint)
-    if ctx_used is not None and ctx_size is not None and ctx_size > 0:
-        ctx_pct = ctx_used / ctx_size * 100
-    else:
-        ctx_pct = ctx.get("used_percentage")
 
     transcript_path = data.get("transcript_path", "")
     if transcript_path and os.path.isfile(transcript_path):
         cache = load_cache()
-        totals = get_session_totals(transcript_path, cache)
+        totals, jsonl_ctx = get_session_totals(transcript_path, cache)
     else:
         totals = {"input": 0, "output": 0, "cache_create": 0, "cache_read": 0}
+        jsonl_ctx = None
+
+    # Prefer JSONL-derived context usage — Claude Code's total_input_tokens
+    # doesn't update reliably for non-Anthropic models (MiniMax, DeepSeek, etc.)
+    if jsonl_ctx is not None:
+        ctx_used = jsonl_ctx
+    else:
+        ctx_used = ctx.get("total_input_tokens")
+
+    if ctx_used is not None and ctx_size is not None and ctx_size > 0:
+        ctx_pct = ctx_used / ctx_size * 100
+    else:
+        ctx_pct = ctx.get("used_percentage")
 
     print(format_statusline(model, totals, ctx_used, ctx_size, ctx_pct))
 
