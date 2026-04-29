@@ -158,7 +158,7 @@ def format_statusline(model: str, totals: dict, ctx_used, ctx_size, ctx_pct) -> 
 
     return (
         f"{BOLD}{CYAN}[{model}]{RESET}"
-        f" | {BOLD}In:{RESET} {fmt_num(totals['input'])}"
+        f" | {BOLD}In(uncached):{RESET} {fmt_num(totals['input'])}"
         f" | {BOLD}Out:{RESET} {fmt_num(totals['output'])}"
         f" | {BOLD}Cache:{RESET} +{fmt_num(totals['cache_create'])}"
         f" / {fmt_num(totals['cache_read'])}"
