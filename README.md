@@ -12,7 +12,7 @@ A lightweight statusline plugin for [Claude Code](https://claude.ai/code) that d
 ## Display
 
 ```
-[MiniMax M2.7] | In: 230.5K | Out: 26.2K | Cache: +99.0K / 5.1M | Total: 5.5M | Ctx: 15.2K / 200.0K (8%)
+[deepseek-v4-pro[1m]] | In: 233.6K | Out: 30.4K | Cache: +99.0K / 7.2M | Total: 7.6M | Ctx: 466.9K / 1.0M (47%)
 ```
 
 Context indicator colors:
