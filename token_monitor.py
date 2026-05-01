@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Claude Code statusline hook: session token + context usage monitor.
-Enhanced with official docs fields: cost, duration, effort, git, progress bar."""
+Styled after webup-statusline: icons, traffic-light colors, pipe separators."""
 import io
 import json
 import os
@@ -22,6 +22,7 @@ YELLOW = "\033[33m"
 RED = "\033[31m"
 GREEN = "\033[32m"
 MAGENTA = "\033[35m"
+GOLD = "\033[33m"  # for cost
 
 
 # ── Helpers ───────────────────────────────────────
@@ -52,16 +53,24 @@ def fmt_pct(val) -> str:
     return f"{val:.0f}%"
 
 
-def progress_bar(pct: int, width: int = 10) -> str:
-    if pct >= 95:
-        color = RED
-    elif pct >= 80:
+def progress_bar(pct: int, ctx_used: int = None, ctx_size: int = None, width: int = 20) -> str:
+    """Traffic-light colored progress bar (webup style).
+    Green > 50% remaining, Yellow 20-50%, Red < 20%."""
+    if pct is None:
+        pct = 0
+    remaining = 100 - pct
+    if remaining > 50:
+        color = GREEN
+    elif remaining > 20:
         color = YELLOW
     else:
-        color = GREEN
+        color = RED
     filled = min(pct * width // 100, width)
     bar = "\u2588" * filled + "\u2591" * (width - filled)
-    return f"{color}{bar}{RESET} {pct}%"
+    val = f"{pct}%"
+    if ctx_used is not None and ctx_size is not None:
+        val = f"{fmt_num(ctx_used)}/{fmt_num(ctx_size)} ({pct}%)"
+    return f"{color}[{bar}]{RESET} {val}"
 
 
 def load_cache() -> dict:
@@ -103,13 +112,14 @@ def get_git_info(cwd: str) -> str:
         ).strip()
         s = len(staged.split("\n")) if staged else 0
         m = len(modified.split("\n")) if modified else 0
-        parts = []
+        dirty = s > 0 or m > 0
+        branch_color = YELLOW if dirty else CYAN
+        parts = [f"{branch_color}\u2387 {branch}{RESET}"]
         if s:
             parts.append(f"{GREEN}+{s}{RESET}")
         if m:
-            parts.append(f"{YELLOW}~{m}{RESET}")
-        extra = " ".join(parts)
-        return f" \u2442 {branch}" + (f" {extra}" if extra else "")
+            parts.append(f"{RED}~{m}{RESET}")
+        return " | " + " ".join(parts)
     except Exception:
         return ""
 
@@ -241,7 +251,13 @@ def main():
     if jsonl_ctx is not None:
         ctx_used = jsonl_ctx
     else:
-        ctx_used = ctx.get("total_input_tokens")
+        # Fallback: current_usage from last API call, or total_input_tokens
+        cur = ctx.get("current_usage") or {}
+        ctx_used = (
+            cur.get("input_tokens", 0)
+            + cur.get("cache_read_input_tokens", 0)
+            + cur.get("cache_creation_input_tokens", 0)
+        ) or ctx.get("total_input_tokens")
 
     # Context percentage
     if ctx_used is not None and ctx_size is not None and ctx_size > 0:
@@ -257,60 +273,88 @@ def main():
     lines_added = cost.get("total_lines_added") or 0
     lines_removed = cost.get("total_lines_removed") or 0
 
-    # Effort & thinking
+    # Effort — from stdin or settings.json (env CLAUDE_CODE_EFFORT_LEVEL takes priority)
     effort = (data.get("effort") or {}).get("level")
+    if not effort:
+        try:
+            with open(os.path.expanduser("~/.claude/settings.json"), "r", encoding="utf-8") as f:
+                settings = json.load(f)
+            effort = settings.get("env", {}).get("CLAUDE_CODE_EFFORT_LEVEL") or settings.get("effortLevel")
+        except Exception:
+            pass
+
+    # Thinking — detect from stdin or settings
     thinking = (data.get("thinking") or {}).get("enabled")
+    if thinking is None:
+        # Check if thinking budget exists in recent JSONL or settings
+        try:
+            with open(os.path.expanduser("~/.claude/settings.json"), "r", encoding="utf-8") as f:
+                settings = json.load(f)
+            if settings.get("thinking") and settings["thinking"].get("enabled"):
+                thinking = True
+        except Exception:
+            pass
 
     # Rate limits
     rate = data.get("rate_limits") or {}
     rate_5h = (rate.get("five_hour") or {}).get("used_percentage")
     rate_7d = (rate.get("seven_day") or {}).get("used_percentage")
 
-    # ── Build output ──────────────────────────────
+    # ── Build single-line output (webup-style) ──────
     dir_name = os.path.basename(cwd) if cwd else "?"
 
-    # Line 1: model, dir, git, effort, thinking
-    line1 = f"{BOLD}{CYAN}[{model}]{RESET} \u2442 {dir_name}"
-    line1 += get_git_info(cwd)
-    if effort:
-        line1 += f" | {DIM}effort:{RESET} {effort}"
-    if thinking:
-        line1 += f" | {MAGENTA}\u270a think{RESET}"
+    parts = [f"{BOLD}{CYAN}\u25c8 {model}{RESET}"]
 
-    # Line 2: progress bar + session tokens
-    bar_str = progress_bar(ctx_pct if ctx_pct is not None else 0)
+    # Context bar — traffic-light colored with values
+    bar_str = progress_bar(ctx_pct if ctx_pct is not None else 0, ctx_used, ctx_size)
+    parts.append(bar_str)
+
+    # Tokens: In(unc) | Out | Cache | Total
     total_tokens = (
         totals["input"] + totals["output"]
         + totals["cache_create"] + totals["cache_read"]
     )
-    line2 = (
-        f"{bar_str}"
-        f" | {BOLD}In(unc):{RESET} {fmt_num(totals['input'])}"
-        f" | {BOLD}Out:{RESET} {fmt_num(totals['output'])}"
-        f" | {BOLD}Cache:{RESET} +{fmt_num(totals['cache_create'])}"
+    parts.append(
+        f"{BOLD}In:{RESET}{fmt_num(totals['input'])}"
+        f" {BOLD}Out:{RESET}{fmt_num(totals['output'])}"
+        f" {BOLD}Cache:{RESET}+{fmt_num(totals['cache_create'])}"
         f"/{fmt_num(totals['cache_read'])}"
-        f" | {BOLD}Total:{RESET} {fmt_num(total_tokens)}"
+        f" {BOLD}Total:{RESET}{fmt_num(total_tokens)}"
     )
 
-    # Line 3: cost, duration, code changes, rate limits
-    parts = []
-    parts.append(f"\u00a5 ${cost_usd:.2f}")
-    if duration_ms > 0:
-        parts.append(f"\u23f1\ufe0f {fmt_duration(duration_ms)}")
-    if lines_added or lines_removed:
-        parts.append(
-            f"{GREEN}+{lines_added}{RESET} {RED}-{lines_removed}{RESET}"
-        )
+    # Cost
+    if cost_usd >= 0.01:
+        parts.append(f"{GOLD}${cost_usd:.2f}{RESET}")
+
+    # Effort — traffic-light colored
+    if effort:
+        if effort in ("high", "xhigh", "max"):
+            effort_color = RED + BOLD
+        elif effort == "medium":
+            effort_color = YELLOW
+        else:
+            effort_color = GREEN
+        parts.append(f"{effort_color}\u21af {effort}{RESET}")
+
+    # Thinking
+    if thinking:
+        parts.append(f"{MAGENTA}\u270a think{RESET}")
+
+    # Dir
+    parts.append(f"{CYAN}\u2302 {dir_name}{RESET}")
+
+    # Git
+    git_info = get_git_info(cwd)
+    if git_info:
+        parts.append(git_info.lstrip(" | "))
+
+    # Rate limits
     if rate_5h is not None:
         parts.append(f"5h:{rate_5h:.0f}%")
     if rate_7d is not None:
         parts.append(f"7d:{rate_7d:.0f}%")
-    line3 = " | ".join(parts) if parts else ""
 
-    print(line1)
-    print(line2)
-    if line3:
-        print(line3)
+    print(" | ".join(parts))
 
 
 if __name__ == "__main__":
