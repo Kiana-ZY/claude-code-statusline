@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
-"""Claude Code statusline hook: session token + context usage monitor."""
+"""Claude Code statusline hook: session token + context usage monitor.
+Enhanced with official docs fields: cost, duration, effort, git, progress bar."""
+import io
 import json
 import os
+import subprocess
 import sys
+import time
+
+# Force UTF-8 output for Windows GBK compatibility
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 CACHE_PATH = os.path.expanduser("~/.claude/statusline/token_cache.json")
 
 # ── ANSI ──────────────────────────────────────────
 RESET = "\033[0m"
 BOLD = "\033[1m"
+DIM = "\033[2m"
 CYAN = "\033[36m"
 YELLOW = "\033[33m"
 RED = "\033[31m"
 GREEN = "\033[32m"
+MAGENTA = "\033[35m"
 
 
 # ── Helpers ───────────────────────────────────────
@@ -24,10 +33,35 @@ def fmt_num(n: int) -> str:
     return str(n)
 
 
+def fmt_duration(ms: int) -> str:
+    if ms <= 0:
+        return "0s"
+    s = ms // 1000
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h}h{m}m"
+    if m > 0:
+        return f"{m}m{s}s"
+    return f"{s}s"
+
+
 def fmt_pct(val) -> str:
     if val is None:
         return "?"
     return f"{val:.0f}%"
+
+
+def progress_bar(pct: int, width: int = 10) -> str:
+    if pct >= 95:
+        color = RED
+    elif pct >= 80:
+        color = YELLOW
+    else:
+        color = GREEN
+    filled = min(pct * width // 100, width)
+    bar = "\u2588" * filled + "\u2591" * (width - filled)
+    return f"{color}{bar}{RESET} {pct}%"
 
 
 def load_cache() -> dict:
@@ -46,6 +80,38 @@ def save_cache(cache: dict) -> None:
         os.replace(tmp, CACHE_PATH)
     except Exception:
         pass
+
+
+# ── Git ───────────────────────────────────────────
+def get_git_info(cwd: str) -> str:
+    try:
+        subprocess.check_output(
+            ["git", "rev-parse", "--git-dir"],
+            cwd=cwd, stderr=subprocess.DEVNULL,
+        )
+        branch = subprocess.check_output(
+            ["git", "branch", "--show-current"],
+            cwd=cwd, text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+        staged = subprocess.check_output(
+            ["git", "diff", "--cached", "--numstat"],
+            cwd=cwd, text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+        modified = subprocess.check_output(
+            ["git", "diff", "--numstat"],
+            cwd=cwd, text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+        s = len(staged.split("\n")) if staged else 0
+        m = len(modified.split("\n")) if modified else 0
+        parts = []
+        if s:
+            parts.append(f"{GREEN}+{s}{RESET}")
+        if m:
+            parts.append(f"{YELLOW}~{m}{RESET}")
+        extra = " ".join(parts)
+        return f" \u2442 {branch}" + (f" {extra}" if extra else "")
+    except Exception:
+        return ""
 
 
 # ── JSONL parsing ─────────────────────────────────
@@ -114,7 +180,9 @@ def get_session_totals(transcript_path: str, cache: dict) -> tuple:
         return cached_totals, last_ctx_used
 
     start_line = prev_line_count + 1 if prev_line_count > 0 else 1
-    new_totals, seen_ids, line_count, new_ctx = parse_jsonl(transcript_path, start_line, seen_ids)
+    new_totals, seen_ids, line_count, new_ctx = parse_jsonl(
+        transcript_path, start_line, seen_ids
+    )
 
     totals = {
         "input": cached_totals.get("input", 0) + new_totals["input"],
@@ -137,36 +205,6 @@ def get_session_totals(transcript_path: str, cache: dict) -> tuple:
     return totals, last_ctx_used
 
 
-# ── Output formatting ─────────────────────────────
-def format_statusline(model: str, totals: dict, ctx_used, ctx_size, ctx_pct) -> str:
-    if ctx_used is not None and ctx_size is not None:
-        ctx_val = f"{fmt_num(ctx_used)} / {fmt_num(ctx_size)}"
-    else:
-        ctx_val = "?"
-
-    pct_str = fmt_pct(ctx_pct)
-    if isinstance(ctx_pct, (int, float)):
-        if ctx_pct >= 95:
-            color = RED
-        elif ctx_pct >= 80:
-            color = YELLOW
-        else:
-            color = GREEN
-        ctx_str = f"{ctx_val} ({color}{pct_str}{RESET})"
-    else:
-        ctx_str = f"{ctx_val} ({pct_str})"
-
-    return (
-        f"{BOLD}{CYAN}[{model}]{RESET}"
-        f" | {BOLD}In(uncached):{RESET} {fmt_num(totals['input'])}"
-        f" | {BOLD}Out:{RESET} {fmt_num(totals['output'])}"
-        f" | {BOLD}Cache:{RESET} +{fmt_num(totals['cache_create'])}"
-        f" / {fmt_num(totals['cache_read'])}"
-        f" | {BOLD}Total:{RESET} {fmt_num(totals['input'] + totals['output'] + totals['cache_create'] + totals['cache_read'])}"
-        f" | {BOLD}Ctx:{RESET} {ctx_str}"
-    )
-
-
 # ── Main ──────────────────────────────────────────
 def main():
     try:
@@ -177,10 +215,20 @@ def main():
     except (json.JSONDecodeError, Exception):
         return
 
-    model = (data.get("model") or {}).get("display_name", data.get("model", {}).get("id", "?"))
+    # Model
+    model = (data.get("model") or {}).get(
+        "display_name", (data.get("model") or {}).get("id", "?")
+    )
+
+    # Workspace
+    workspace = data.get("workspace") or {}
+    cwd = workspace.get("current_dir") or data.get("cwd") or ""
+
+    # Context window
     ctx = data.get("context_window") or {}
     ctx_size = ctx.get("context_window_size")
 
+    # Session tokens from JSONL
     transcript_path = data.get("transcript_path", "")
     if transcript_path and os.path.isfile(transcript_path):
         cache = load_cache()
@@ -189,19 +237,80 @@ def main():
         totals = {"input": 0, "output": 0, "cache_create": 0, "cache_read": 0}
         jsonl_ctx = None
 
-    # Prefer JSONL-derived context usage — Claude Code's total_input_tokens
-    # doesn't update reliably for non-Anthropic models (MiniMax, DeepSeek, etc.)
+    # Context usage: prefer JSONL-derived (works for non-Anthropic models)
     if jsonl_ctx is not None:
         ctx_used = jsonl_ctx
     else:
         ctx_used = ctx.get("total_input_tokens")
 
+    # Context percentage
     if ctx_used is not None and ctx_size is not None and ctx_size > 0:
-        ctx_pct = ctx_used / ctx_size * 100
+        ctx_pct = int(ctx_used / ctx_size * 100)
     else:
-        ctx_pct = ctx.get("used_percentage")
+        pct_raw = ctx.get("used_percentage")
+        ctx_pct = int(pct_raw) if pct_raw is not None else None
 
-    print(format_statusline(model, totals, ctx_used, ctx_size, ctx_pct))
+    # Cost
+    cost = data.get("cost") or {}
+    cost_usd = cost.get("total_cost_usd") or 0
+    duration_ms = cost.get("total_duration_ms") or 0
+    lines_added = cost.get("total_lines_added") or 0
+    lines_removed = cost.get("total_lines_removed") or 0
+
+    # Effort & thinking
+    effort = (data.get("effort") or {}).get("level")
+    thinking = (data.get("thinking") or {}).get("enabled")
+
+    # Rate limits
+    rate = data.get("rate_limits") or {}
+    rate_5h = (rate.get("five_hour") or {}).get("used_percentage")
+    rate_7d = (rate.get("seven_day") or {}).get("used_percentage")
+
+    # ── Build output ──────────────────────────────
+    dir_name = os.path.basename(cwd) if cwd else "?"
+
+    # Line 1: model, dir, git, effort, thinking
+    line1 = f"{BOLD}{CYAN}[{model}]{RESET} \u2442 {dir_name}"
+    line1 += get_git_info(cwd)
+    if effort:
+        line1 += f" | {DIM}effort:{RESET} {effort}"
+    if thinking:
+        line1 += f" | {MAGENTA}\u270a think{RESET}"
+
+    # Line 2: progress bar + session tokens
+    bar_str = progress_bar(ctx_pct if ctx_pct is not None else 0)
+    total_tokens = (
+        totals["input"] + totals["output"]
+        + totals["cache_create"] + totals["cache_read"]
+    )
+    line2 = (
+        f"{bar_str}"
+        f" | {BOLD}In(unc):{RESET} {fmt_num(totals['input'])}"
+        f" | {BOLD}Out:{RESET} {fmt_num(totals['output'])}"
+        f" | {BOLD}Cache:{RESET} +{fmt_num(totals['cache_create'])}"
+        f"/{fmt_num(totals['cache_read'])}"
+        f" | {BOLD}Total:{RESET} {fmt_num(total_tokens)}"
+    )
+
+    # Line 3: cost, duration, code changes, rate limits
+    parts = []
+    parts.append(f"\u00a5 ${cost_usd:.2f}")
+    if duration_ms > 0:
+        parts.append(f"\u23f1\ufe0f {fmt_duration(duration_ms)}")
+    if lines_added or lines_removed:
+        parts.append(
+            f"{GREEN}+{lines_added}{RESET} {RED}-{lines_removed}{RESET}"
+        )
+    if rate_5h is not None:
+        parts.append(f"5h:{rate_5h:.0f}%")
+    if rate_7d is not None:
+        parts.append(f"7d:{rate_7d:.0f}%")
+    line3 = " | ".join(parts) if parts else ""
+
+    print(line1)
+    print(line2)
+    if line3:
+        print(line3)
 
 
 if __name__ == "__main__":
